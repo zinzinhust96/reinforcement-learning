@@ -1,8 +1,8 @@
 # DQN modifications
 # 1. Use Adam and a learning rate of 0.00001.
 # 2. Replay memory stores the last one million transitions. epsilon_decay_steps = 1 million
-# 3. Use the tf.variance_scaling_initializer with scale = 2, not Xavier
-# 4. Huber loss
+# 3. Use the tf.variance_scaling_initializer with scale = 2, not Xavier\
+# TODO IMPORTANT (4) Make sure that the terminal flag is passed when a life is lost! (terminal_life_lost)
 
 import gym
 from gym.wrappers import Monitor
@@ -13,41 +13,193 @@ import random
 import sys
 import tensorflow as tf
 
+# limit
+config = tf.ConfigProto()
+config.gpu_options.allow_growth=True
+sess = tf.Session(config=config)
+
 if "../" not in sys.path:
   sys.path.append("../")
 
 from lib import plotting
 from collections import deque, namedtuple
 
-env = gym.envs.make("Breakout-v0")
+# env = gym.envs.make("Breakout-v0")
 
 # Atari Actions: 0 (noop), 1 (fire), 2 (left) and 3 (right) are valid actions
 VALID_ACTIONS = [0, 1, 2, 3]
 
-class StateProcessor():
-    """
-    Processes a raw Atari images. Resizes it and converts it to grayscale.
-    """
-    def __init__(self):
-        # Build the Tensorflow graph
-        with tf.variable_scope("state_processor"):
-            self.input_state = tf.placeholder(shape=[210, 160, 3], dtype=tf.uint8)
-            self.output = tf.image.rgb_to_grayscale(self.input_state)
-            self.output = tf.image.crop_to_bounding_box(self.output, 34, 0, 160, 160)
-            self.output = tf.image.resize_images(
-                self.output, [84, 84], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-            self.output = tf.squeeze(self.output)
+def clip_reward(reward):
+    if reward > 0:
+        return 1
+    elif reward == 0:
+        return 0
+    else:
+        return -1
 
-    def process(self, sess, state):
+class FrameProcessor(object):
+    """Resizes and converts RGB Atari frames to grayscale"""
+    def __init__(self, frame_height=84, frame_width=84):
+        """
+        Args:
+            frame_height: Integer, Height of a frame of an Atari game
+            frame_width: Integer, Width of a frame of an Atari game
+        """
+        self.frame_height = frame_height
+        self.frame_width = frame_width
+        self.frame = tf.placeholder(shape=[210, 160, 3], dtype=tf.uint8)
+        self.processed = tf.image.rgb_to_grayscale(self.frame)
+        self.processed = tf.image.crop_to_bounding_box(self.processed, 34, 0, 160, 160)
+        self.processed = tf.image.resize_images(self.processed, 
+                                                [self.frame_height, self.frame_width], 
+                                                method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+    
+    def __call__(self, session, frame):
+        """
+        Args:
+            session: A Tensorflow session object
+            frame: A (210, 160, 3) frame of an Atari game in RGB
+        Returns:
+            A processed (84, 84, 1) frame in grayscale
+        """
+        return session.run(self.processed, feed_dict={self.frame:frame})
+
+class Atari(object):
+    """Wrapper for the environment provided by gym"""
+    def __init__(self, envName, no_op_steps=10, agent_history_length=4):
+        self.env = gym.make(envName)
+        self.process_frame = FrameProcessor()
+        self.state = None
+        self.last_lives = 0
+        self.no_op_steps = no_op_steps
+        self.agent_history_length = agent_history_length
+
+    def reset(self, sess, evaluation=False):
         """
         Args:
             sess: A Tensorflow session object
-            state: A [210, 160, 3] Atari RGB State
-
-        Returns:
-            A processed [84, 84] state representing grayscale values.
+            evaluation: A boolean saying whether the agent is evaluating or training
+        Resets the environment and stacks four frames ontop of each other to 
+        create the first state
         """
-        return sess.run(self.output, { self.input_state: state })
+        frame = self.env.reset()
+        self.last_lives = 0
+        terminal_life_lost = True # Set to true so that the agent starts 
+                                  # with a 'FIRE' action when evaluating
+        if evaluation:
+            for _ in range(random.randint(1, self.no_op_steps)):
+                frame, _, _, _ = self.env.step(1) # Action 'Fire'
+        processed_frame = self.process_frame(sess, frame)   # (★★★)
+        self.state = np.repeat(processed_frame, self.agent_history_length, axis=2)
+        
+        return terminal_life_lost
+
+    def step(self, sess, action):
+        """
+        Args:
+            sess: A Tensorflow session object
+            action: Integer, action the agent performs
+        Performs an action and observes the reward and terminal state from the environment
+        """
+        new_frame, reward, terminal, info = self.env.step(action)  # (5★)
+            
+        if info['ale.lives'] < self.last_lives:
+            terminal_life_lost = True
+        else:
+            terminal_life_lost = terminal
+        self.last_lives = info['ale.lives']
+        
+        processed_new_frame = self.process_frame(sess, new_frame)   # (6★)
+        new_state = np.append(self.state[:, :, 1:], processed_new_frame, axis=2) # (6★)   
+        self.state = new_state
+        
+        return processed_new_frame, reward, terminal, terminal_life_lost, new_frame
+
+class ReplayMemory(object):
+    """Replay Memory that stores the last size=1,000,000 transitions"""
+    def __init__(self, size=1000000, frame_height=84, frame_width=84, 
+                 agent_history_length=4, batch_size=32):
+        """
+        Args:
+            size: Integer, Number of stored transitions
+            frame_height: Integer, Height of a frame of an Atari game
+            frame_width: Integer, Width of a frame of an Atari game
+            agent_history_length: Integer, Number of frames stacked together to create a state
+            batch_size: Integer, Number if transitions returned in a minibatch
+        """
+        self.size = size
+        self.frame_height = frame_height
+        self.frame_width = frame_width
+        self.agent_history_length = agent_history_length
+        self.batch_size = batch_size
+        self.count = 0
+        self.current = 0
+        
+        # Pre-allocate memory
+        self.actions = np.empty(self.size, dtype=np.int32)
+        self.rewards = np.empty(self.size, dtype=np.float32)
+        self.frames = np.empty((self.size, self.frame_height, self.frame_width), dtype=np.uint8)
+        self.terminal_flags = np.empty(self.size, dtype=np.bool)
+        
+        # Pre-allocate memory for the states and new_states in a minibatch
+        self.states = np.empty((self.batch_size, self.agent_history_length, 
+                                self.frame_height, self.frame_width), dtype=np.uint8)
+        self.new_states = np.empty((self.batch_size, self.agent_history_length, 
+                                    self.frame_height, self.frame_width), dtype=np.uint8)
+        self.indices = np.empty(self.batch_size, dtype=np.int32)
+        
+    def add_experience(self, action, frame, reward, terminal):
+        """
+        Args:
+            action: An integer between 0 and env.action_space.n - 1 
+                determining the action the agent perfomed
+            frame: A (84, 84, 1) frame of an Atari game in grayscale
+            reward: A float determining the reward the agend received for performing an action
+            terminal: A bool stating whether the episode terminated
+        """
+        if frame.shape != (self.frame_height, self.frame_width):
+            raise ValueError('Dimension of frame is wrong!')
+        self.actions[self.current] = action
+        self.frames[self.current, ...] = frame
+        self.rewards[self.current] = reward
+        self.terminal_flags[self.current] = terminal
+        self.count = max(self.count, self.current+1)
+        self.current = (self.current + 1) % self.size
+             
+    def _get_state(self, index):
+        if self.count is 0:
+            raise ValueError("The replay memory is empty!")
+        if index < self.agent_history_length - 1:
+            raise ValueError("Index must be min 3")
+        return self.frames[index-self.agent_history_length+1:index+1, ...]
+        
+    def _get_valid_indices(self):
+        for i in range(self.batch_size):
+            while True:
+                index = random.randint(self.agent_history_length, self.count - 1)
+                if index < self.agent_history_length:
+                    continue
+                if index >= self.current and index - self.agent_history_length <= self.current:
+                    continue
+                if self.terminal_flags[index - self.agent_history_length:index].any():
+                    continue
+                break
+            self.indices[i] = index
+            
+    def get_minibatch(self):
+        """
+        Returns a minibatch of self.batch_size = 32 transitions
+        """
+        if self.count < self.agent_history_length:
+            raise ValueError('Not enough memories to get a minibatch')
+        
+        self._get_valid_indices()
+            
+        for i, idx in enumerate(self.indices):
+            self.states[i] = self._get_state(idx - 1)
+            self.new_states[i] = self._get_state(idx)
+        
+        return np.transpose(self.states, axes=(0, 2, 3, 1)), self.actions[self.indices], self.rewards[self.indices], np.transpose(self.new_states, axes=(0, 2, 3, 1)), self.terminal_flags[self.indices]
 
 class Estimator():
     """Q-Value Estimator neural network.
@@ -104,18 +256,18 @@ class Estimator():
         self.predictions = tf.contrib.layers.fully_connected(fc1, len(VALID_ACTIONS))
 
         # Get the predictions for the chosen actions only
-        # gather_indices = tf.range(batch_size) * tf.shape(self.predictions)[1] + self.actions_pl
-        # self.action_predictions = tf.gather(tf.reshape(self.predictions, [-1]), gather_indices)
+        gather_indices = tf.range(batch_size) * tf.shape(self.predictions)[1] + self.actions_pl
+        self.action_predictions = tf.gather(tf.reshape(self.predictions, [-1]), gather_indices)
 
         # Q value of the action that was performed (check it again)
-        self.action_predictions = tf.reduce_sum(tf.multiply(self.predictions, tf.one_hot(self.actions_pl, tf.shape(self.predictions)[1], dtype=tf.float32)), axis=1)
+        # self.action_predictions = tf.reduce_sum(tf.multiply(self.predictions, tf.one_hot(self.actions_pl, tf.shape(self.predictions)[1], dtype=tf.float32)), axis=1)
 
         # Calculate the loss
-        self.losses = tf.losses.huber_loss(self.y_pl, self.action_predictions)
+        self.losses = tf.squared_difference(self.y_pl, self.action_predictions)
         self.loss = tf.reduce_mean(self.losses)
 
-        # Optimizer Parameters from original paper
-        self.optimizer = tf.train.AdamOptimizer(learning_rate=0.00001)
+        # Optimizer Parameters from original paper 
+        self.optimizer = tf.train.RMSPropOptimizer(0.00025, 0.99, 0.0, 1e-6)
         self.train_op = self.optimizer.minimize(self.loss, global_step=tf.contrib.framework.get_global_step())
 
         # Summaries for Tensorboard
@@ -207,19 +359,19 @@ def make_epsilon_greedy_policy(estimator, nA):
 
 
 def deep_q_learning(sess,
-                    env,
+                    atari,
                     q_estimator,
                     target_estimator,
                     state_processor,
                     num_episodes,
                     experiment_dir,
-                    replay_memory_size=500000,
+                    replay_memory_size=1000000,
                     replay_memory_init_size=50000,
                     update_target_estimator_every=10000,
                     discount_factor=0.99,
                     epsilon_start=1.0,
                     epsilon_end=0.1,
-                    epsilon_decay_steps=500000,
+                    epsilon_decay_steps=1000000,
                     batch_size=32,
                     record_video_every=50):
     """
@@ -228,7 +380,7 @@ def deep_q_learning(sess,
 
     Args:
         sess: Tensorflow Session object
-        env: OpenAI environment
+        atari: Wrapper of OpenAI environment
         q_estimator: Estimator object used for the q values
         target_estimator: Estimator object used for the targets
         state_processor: A StateProcessor object
@@ -254,7 +406,7 @@ def deep_q_learning(sess,
     Transition = namedtuple("Transition", ["state", "action", "reward", "next_state", "done"])
 
     # The replay memory
-    replay_memory = []
+    replay_memory = ReplayMemory(size=replay_memory_size, batch_size=batch_size)   # (★)
 
     # Keeps track of useful statistics
     stats = plotting.EpisodeStats(
@@ -290,29 +442,30 @@ def deep_q_learning(sess,
 
     # Populate the replay memory with initial experience
     print("Populating replay memory...")
-    state = env.reset()
-    state = state_processor.process(sess, state)
-    state = np.stack([state] * 4, axis=2)
+    terminal_life_lost = atari.reset(sess)
     for i in range(replay_memory_init_size):
-        action_probs = policy(sess, state, epsilons[min(total_t, epsilon_decay_steps-1)])
+        action_probs = policy(sess, atari.state, epsilons[min(total_t, epsilon_decay_steps-1)])
         action = np.random.choice(np.arange(len(action_probs)), p=action_probs)
-        next_state, reward, done, _ = env.step(VALID_ACTIONS[action])
-        next_state = state_processor.process(sess, next_state)
-        next_state = np.append(state[:,:,1:], np.expand_dims(next_state, 2), axis=2)
-        replay_memory.append(Transition(state, action, reward, next_state, done))
-        if done:
-            state = env.reset()
-            state = state_processor.process(sess, state)
-            state = np.stack([state] * 4, axis=2)
-        else:
-            state = next_state
+        processed_new_frame, reward, terminal, terminal_life_lost, _ = atari.step(sess, action) 
+
+        # Clip the reward
+        clipped_reward = clip_reward(reward)
+        
+        # Store transition in the replay memory
+        replay_memory.add_experience(action=action, 
+                                    frame=processed_new_frame[:, :, 0],
+                                    reward=clipped_reward, 
+                                    terminal=terminal_life_lost)
+
+        if terminal:
+            terminal_life_lost = atari.reset(sess)
 
     # Record videos
     # Use the gym env Monitor wrapper
-    env = Monitor(env,
-                  directory=monitor_path,
-                  resume=True,
-                  video_callable=lambda count: count % record_video_every ==0)
+    # env = Monitor(env,
+    #               directory=monitor_path,
+    #               resume=True,
+    #               video_callable=lambda count: count % record_video_every ==0)
 
     for i_episode in range(num_episodes):
 
@@ -320,9 +473,7 @@ def deep_q_learning(sess,
         saver.save(tf.get_default_session(), checkpoint_path)
 
         # Reset the environment
-        state = env.reset()
-        state = state_processor.process(sess, state)
-        state = np.stack([state] * 4, axis=2)
+        terminal_life_lost = atari.reset(sess)
         loss = None
 
         # One step in the environment
@@ -347,42 +498,40 @@ def deep_q_learning(sess,
             sys.stdout.flush()
 
             # Take a step
-            action_probs = policy(sess, state, epsilon)
+            action_probs = policy(sess, atari.state, epsilon)
             action = np.random.choice(np.arange(len(action_probs)), p=action_probs)
-            next_state, reward, done, _ = env.step(VALID_ACTIONS[action])
-            next_state = state_processor.process(sess, next_state)
-            next_state = np.append(state[:,:,1:], np.expand_dims(next_state, 2), axis=2)
+            processed_new_frame, reward, terminal, terminal_life_lost, _ = atari.step(sess, action)
 
-            # If our replay memory is full, pop the first element
-            if len(replay_memory) == replay_memory_size:
-                replay_memory.pop(0)
-
-            # Save transition to replay memory
-            replay_memory.append(Transition(state, action, reward, next_state, done))   
+            # Clip the reward
+            clipped_reward = clip_reward(reward)
+        
+            # Store transition in the replay memory
+            replay_memory.add_experience(action=action, 
+                                        frame=processed_new_frame[:, :, 0],
+                                        reward=clipped_reward, 
+                                        terminal=terminal_life_lost) 
 
             # Update statistics
             stats.episode_rewards[i_episode] += reward
             stats.episode_lengths[i_episode] = t
 
-            # Sample a minibatch from the replay memory
-            samples = random.sample(replay_memory, batch_size)
-            states_batch, action_batch, reward_batch, next_states_batch, done_batch = map(np.array, zip(*samples))
+            # Draw a minibatch from the replay memory
+            states_batch, action_batch, reward_batch, next_states_batch, terminal_flag_batch = replay_memory.get_minibatch()    
 
             # Calculate q values and targets (Double DQN)
             q_values_next = q_estimator.predict(sess, next_states_batch)
             best_actions = np.argmax(q_values_next, axis=1)
             q_values_next_target = target_estimator.predict(sess, next_states_batch)
-            targets_batch = reward_batch + np.invert(done_batch).astype(np.float32) * \
+            targets_batch = reward_batch + (1-terminal_flag_batch) * \
                 discount_factor * q_values_next_target[np.arange(batch_size), best_actions]
 
             # Perform gradient descent update
             states_batch = np.array(states_batch)
             loss = q_estimator.update(sess, states_batch, action_batch, targets_batch)
 
-            if done:
+            if terminal:
                 break
 
-            state = next_state
             total_t += 1
 
         # Add summaries to tensorboard
@@ -396,14 +545,19 @@ def deep_q_learning(sess,
             episode_lengths=stats.episode_lengths[:i_episode+1],
             episode_rewards=stats.episode_rewards[:i_episode+1])
 
-    env.monitor.close()
+    # atari.env.monitor.close()
     return stats
 
 
 tf.reset_default_graph()
 
+# Atari environment wrapper
+ENV_NAME = 'Breakout-v0'
+NO_OP_STEPS = 10    # Number of 'NOOP' or 'FIRE' actions at the beginning of an 
+atari = Atari(ENV_NAME, NO_OP_STEPS)
+
 # Where we save our checkpoints and graphs
-experiment_dir = os.path.abspath("./experiments/{}".format(env.spec.id))
+experiment_dir = os.path.abspath("./experiments/{}".format(atari.env.spec.id))
 
 # Create a glboal step variable
 global_step = tf.Variable(0, name='global_step', trainable=False)
@@ -413,12 +567,12 @@ q_estimator = Estimator(scope="q", summaries_dir=experiment_dir)
 target_estimator = Estimator(scope="target_q")
 
 # State processor
-state_processor = StateProcessor()
+state_processor = FrameProcessor()
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
     for t, stats in deep_q_learning(sess,
-                                    env,
+                                    atari,
                                     q_estimator=q_estimator,
                                     target_estimator=target_estimator,
                                     state_processor=state_processor,
